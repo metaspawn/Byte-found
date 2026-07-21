@@ -1,6 +1,7 @@
 /* bytefound.c - Bytefound v0.1
    A C compiler written from scratch, targeting 16-bit x86 real mode.
-   Supports:  int <name>() { return <expression>; }
+   Supports:  functions, return, local int variables, assignment,
+              and integer arithmetic.
    Build:     gcc -std=c99 -Wall -Wextra -O2 src/bytefound.c -o bytefound.exe */
 
 #include <stdio.h>
@@ -68,7 +69,8 @@ static int is_keyword(const char *s, int len) {
     return 0;
 }
 
-/* Two-character punctuators, ready for ==, <=, etc. */
+/* Two-character punctuators are matched before single ones, so that
+   '==' never gets split into two '=' tokens. */
 static int read_punct(const char *p) {
     static const char *two[] = { "==", "!=", "<=", ">=", NULL };
     for (int i = 0; two[i]; i++)
@@ -166,12 +168,62 @@ static long expect_number(void) {
     return v;
 }
 
+/* =============== local variables ===============
+   Every local int takes 2 bytes and lives at a negative offset
+   from BP:  first local at [bp-2], second at [bp-4], and so on. */
+
+#define MAX_LOCALS 64
+
+typedef struct {
+    char name[64];
+    int  offset;      /* negative offset from BP */
+} Local;
+
+static Local locals[MAX_LOCALS];
+static int   nlocals;
+
+static Local *find_local(Token *t) {
+    for (int i = 0; i < nlocals; i++)
+        if ((int)strlen(locals[i].name) == t->len &&
+            !strncmp(locals[i].name, t->loc, (size_t)t->len))
+            return &locals[i];
+    return NULL;
+}
+
+static Local *add_local(Token *t) {
+    if (find_local(t)) error_at(t->loc, "variable already declared");
+    if (nlocals >= MAX_LOCALS) error_at(t->loc, "too many local variables");
+    if (t->len >= (int)sizeof(locals[0].name))
+        error_at(t->loc, "variable name too long");
+
+    Local *lv = &locals[nlocals];
+    memcpy(lv->name, t->loc, (size_t)t->len);
+    lv->name[t->len] = '\0';
+    lv->offset = -2 * (nlocals + 1);
+    nlocals++;
+    return lv;
+}
+
+/* Count declarations ahead of time so the prologue knows how much
+   stack space to reserve. Expects t to point at the opening '{'. */
+static int count_locals(Token *t) {
+    int depth = 0, n = 0;
+    for (; t->kind != TK_EOF; t = t->next) {
+        if (equal(t, "{")) { depth++; continue; }
+        if (equal(t, "}")) { if (--depth == 0) break; continue; }
+        if (equal(t, "int") && t->next->kind == TK_IDENT) n++;
+    }
+    return n;
+}
+
 /* =============== expression code generation =============== */
 /* Every rule leaves its result in AX.
-     expr    := term  (('+' | '-') term)*
+     expr    := assign
+     assign  := IDENT '=' assign | add
+     add     := term  (('+' | '-') term)*
      term    := unary (('*' | '/') unary)*
      unary   := ('+' | '-')? primary
-     primary := NUMBER | '(' expr ')'                                     */
+     primary := NUMBER | IDENT | '(' expr ')'                             */
 
 static void gen_expr(void);
 
@@ -181,6 +233,15 @@ static void gen_primary(void) {
         expect(")");
         return;
     }
+
+    if (tk->kind == TK_IDENT) {
+        Local *lv = find_local(tk);
+        if (!lv) error_at(tk->loc, "undeclared variable");
+        fprintf(out, "    mov ax, [bp%+d]\n", lv->offset);
+        tk = tk->next;
+        return;
+    }
+
     const char *loc = tk->loc;
     long v = expect_number();
     if (v > 32767 || v < -32768)
@@ -202,8 +263,8 @@ static void gen_term(void) {
         if (!mul && !div) return;
         tk = tk->next;
 
-        fprintf(out, "    push ax\n");    /* save left operand    */
-        gen_unary();                       /* right operand in ax  */
+        fprintf(out, "    push ax\n");    /* save left operand   */
+        gen_unary();                       /* right operand in ax */
         fprintf(out, "    mov cx, ax\n");
         fprintf(out, "    pop ax\n");
         if (mul) {
@@ -215,7 +276,7 @@ static void gen_term(void) {
     }
 }
 
-static void gen_expr(void) {
+static void gen_add(void) {
     gen_term();
     for (;;) {
         int add = equal(tk, "+");
@@ -231,6 +292,23 @@ static void gen_expr(void) {
     }
 }
 
+/* Assignment is right-associative, so a = b = 3 works. */
+static void gen_assign(void) {
+    if (tk->kind == TK_IDENT && equal(tk->next, "=")) {
+        Local *lv = find_local(tk);
+        if (!lv) error_at(tk->loc, "undeclared variable");
+        tk = tk->next->next;              /* skip IDENT and '=' */
+        gen_assign();
+        fprintf(out, "    mov [bp%+d], ax\n", lv->offset);
+        return;
+    }
+    gen_add();
+}
+
+static void gen_expr(void) {
+    gen_assign();
+}
+
 /* =============== statements and functions =============== */
 
 static void gen_epilogue(void) {
@@ -239,7 +317,9 @@ static void gen_epilogue(void) {
     fprintf(out, "    ret\n");
 }
 
-/* stmt := 'return' expr ';' */
+/* stmt := 'return' expr ';'
+         | 'int' IDENT ('=' expr)? ';'
+         | expr ';'                                                       */
 static void gen_stmt(void) {
     if (consume("return")) {
         gen_expr();
@@ -247,7 +327,23 @@ static void gen_stmt(void) {
         gen_epilogue();
         return;
     }
-    error_at(tk->loc, "statement not supported yet");
+
+    if (consume("int")) {
+        if (tk->kind != TK_IDENT)
+            error_at(tk->loc, "expected a variable name");
+        Local *lv = add_local(tk);
+        tk = tk->next;
+
+        if (consume("=")) {
+            gen_expr();
+            fprintf(out, "    mov [bp%+d], ax\n", lv->offset);
+        }
+        expect(";");
+        return;
+    }
+
+    gen_expr();
+    expect(";");
 }
 
 /* function := 'int' IDENT '(' ')' '{' stmt* '}' */
@@ -265,11 +361,17 @@ static void gen_function(void) {
 
     expect("(");
     expect(")");
+
+    /* Reset the local table and measure the frame before emitting. */
+    nlocals = 0;
+    int frame = count_locals(tk) * 2;
+
     expect("{");
 
     fprintf(out, "%s:\n", name);
     fprintf(out, "    push bp\n");
     fprintf(out, "    mov bp, sp\n");
+    if (frame) fprintf(out, "    sub sp, %d\n", frame);
 
     while (!equal(tk, "}")) {
         if (tk->kind == TK_EOF) error_at(tk->loc, "missing '}'");
@@ -329,7 +431,7 @@ static void compile_file(const char *path) {
 
     tk = tokenize(text);
 
-    fprintf(out, "; generated by Bytefound v0.1 - 16-bit real mode\n");
+    fprintf(out, "; generated by Bytefound v0.2 - 16-bit real mode\n");
     fprintf(out, "bits 16\n\n");
 
     while (tk->kind != TK_EOF)
@@ -345,7 +447,7 @@ static void compile_file(const char *path) {
 
 int main(int argc, char **argv) {
     if (argc < 2) {
-        printf("Bytefound v0.1 - 16-bit real mode C compiler\n");
+        printf("Bytefound v0.2 - 16-bit real mode C compiler\n");
         printf("Usage: bytefound file.c ...\n");
         printf("Or drop .c files onto the executable.\n\n");
         printf("Press Enter to exit...");

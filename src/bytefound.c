@@ -1,7 +1,7 @@
-/* bytefound.c - Bytefound v0.1
+/* bytefound.c - Byte-found v0.3
    A C compiler written from scratch, targeting 16-bit x86 real mode.
    Supports:  functions, return, local int variables, assignment,
-              and integer arithmetic.
+              integer arithmetic, comparisons, if/else and while.
    Build:     gcc -std=c99 -Wall -Wextra -O2 src/bytefound.c -o bytefound.exe */
 
 #include <stdio.h>
@@ -60,7 +60,9 @@ static Token *new_token(TokenKind kind, const char *loc, int len) {
 static int is_ident_start(int c) { return isalpha(c) || c == '_'; }
 static int is_ident_char(int c)  { return isalnum(c) || c == '_'; }
 
-static const char *KEYWORDS[] = { "int", "return", NULL };
+static const char *KEYWORDS[] = {
+    "int", "return", "if", "else", "while", NULL
+};
 
 static int is_keyword(const char *s, int len) {
     for (int i = 0; KEYWORDS[i]; i++)
@@ -168,6 +170,14 @@ static long expect_number(void) {
     return v;
 }
 
+/* =============== labels ===============
+   NASM scopes labels starting with '.' to the preceding global label,
+   so per-function numbering never collides across functions. */
+
+static int label_id;
+
+static int new_label(void) { return label_id++; }
+
 /* =============== local variables ===============
    Every local int takes 2 bytes and lives at a negative offset
    from BP:  first local at [bp-2], second at [bp-4], and so on. */
@@ -218,12 +228,14 @@ static int count_locals(Token *t) {
 
 /* =============== expression code generation =============== */
 /* Every rule leaves its result in AX.
-     expr    := assign
-     assign  := IDENT '=' assign | add
-     add     := term  (('+' | '-') term)*
-     term    := unary (('*' | '/') unary)*
-     unary   := ('+' | '-')? primary
-     primary := NUMBER | IDENT | '(' expr ')'                             */
+     expr       := assign
+     assign     := IDENT '=' assign | equality
+     equality   := relational (('==' | '!=') relational)*
+     relational := add (('<' | '<=' | '>' | '>=') add)*
+     add        := term  (('+' | '-') term)*
+     term       := unary (('*' | '/') unary)*
+     unary      := ('+' | '-')? primary
+     primary    := NUMBER | IDENT | '(' expr ')'                          */
 
 static void gen_expr(void);
 
@@ -292,6 +304,43 @@ static void gen_add(void) {
     }
 }
 
+/* Comparisons leave 1 or 0 in AX, matching C semantics. */
+static void gen_compare(const char *setcc, void (*next)(void)) {
+    fprintf(out, "    push ax\n");
+    next();
+    fprintf(out, "    mov cx, ax\n");
+    fprintf(out, "    pop ax\n");
+    fprintf(out, "    cmp ax, cx\n");
+    fprintf(out, "    %s al\n", setcc);
+    fprintf(out, "    mov ah, 0\n");
+}
+
+static void gen_relational(void) {
+    gen_add();
+    for (;;) {
+        const char *setcc;
+        if      (equal(tk, "<"))  setcc = "setl";
+        else if (equal(tk, "<=")) setcc = "setle";
+        else if (equal(tk, ">"))  setcc = "setg";
+        else if (equal(tk, ">=")) setcc = "setge";
+        else return;
+        tk = tk->next;
+        gen_compare(setcc, gen_add);
+    }
+}
+
+static void gen_equality(void) {
+    gen_relational();
+    for (;;) {
+        const char *setcc;
+        if      (equal(tk, "==")) setcc = "sete";
+        else if (equal(tk, "!=")) setcc = "setne";
+        else return;
+        tk = tk->next;
+        gen_compare(setcc, gen_relational);
+    }
+}
+
 /* Assignment is right-associative, so a = b = 3 works. */
 static void gen_assign(void) {
     if (tk->kind == TK_IDENT && equal(tk->next, "=")) {
@@ -302,7 +351,7 @@ static void gen_assign(void) {
         fprintf(out, "    mov [bp%+d], ax\n", lv->offset);
         return;
     }
-    gen_add();
+    gen_equality();
 }
 
 static void gen_expr(void) {
@@ -317,10 +366,58 @@ static void gen_epilogue(void) {
     fprintf(out, "    ret\n");
 }
 
-/* stmt := 'return' expr ';'
+static void gen_stmt(void);
+
+/* Consumes statements until the matching '}'. */
+static void gen_block(void) {
+    while (!equal(tk, "}")) {
+        if (tk->kind == TK_EOF) error_at(tk->loc, "missing '}'");
+        gen_stmt();
+    }
+    expect("}");
+}
+
+/* stmt := '{' stmt* '}'
+         | 'if' '(' expr ')' stmt ('else' stmt)?
+         | 'while' '(' expr ')' stmt
+         | 'return' expr ';'
          | 'int' IDENT ('=' expr)? ';'
          | expr ';'                                                       */
 static void gen_stmt(void) {
+    if (consume("{")) {
+        gen_block();
+        return;
+    }
+
+    if (consume("if")) {
+        int l = new_label();
+        expect("(");
+        gen_expr();
+        expect(")");
+        fprintf(out, "    cmp ax, 0\n");
+        fprintf(out, "    je .L%d_else\n", l);
+        gen_stmt();
+        fprintf(out, "    jmp .L%d_end\n", l);
+        fprintf(out, ".L%d_else:\n", l);
+        if (consume("else")) gen_stmt();
+        fprintf(out, ".L%d_end:\n", l);
+        return;
+    }
+
+    if (consume("while")) {
+        int l = new_label();
+        fprintf(out, ".L%d_begin:\n", l);
+        expect("(");
+        gen_expr();
+        expect(")");
+        fprintf(out, "    cmp ax, 0\n");
+        fprintf(out, "    je .L%d_end\n", l);
+        gen_stmt();
+        fprintf(out, "    jmp .L%d_begin\n", l);
+        fprintf(out, ".L%d_end:\n", l);
+        return;
+    }
+
     if (consume("return")) {
         gen_expr();
         expect(";");
@@ -362,8 +459,9 @@ static void gen_function(void) {
     expect("(");
     expect(")");
 
-    /* Reset the local table and measure the frame before emitting. */
-    nlocals = 0;
+    /* Reset per-function state and measure the frame before emitting. */
+    nlocals  = 0;
+    label_id = 0;
     int frame = count_locals(tk) * 2;
 
     expect("{");
@@ -373,11 +471,7 @@ static void gen_function(void) {
     fprintf(out, "    mov bp, sp\n");
     if (frame) fprintf(out, "    sub sp, %d\n", frame);
 
-    while (!equal(tk, "}")) {
-        if (tk->kind == TK_EOF) error_at(tk->loc, "missing '}'");
-        gen_stmt();
-    }
-    expect("}");
+    gen_block();
 
     /* Fallback in case the function did not end with a return. */
     fprintf(out, "    mov ax, 0\n");
@@ -431,7 +525,7 @@ static void compile_file(const char *path) {
 
     tk = tokenize(text);
 
-    fprintf(out, "; generated by Bytefound v0.2 - 16-bit real mode\n");
+    fprintf(out, "; generated by Byte-found v0.3 - 16-bit real mode\n");
     fprintf(out, "bits 16\n\n");
 
     while (tk->kind != TK_EOF)
@@ -447,7 +541,7 @@ static void compile_file(const char *path) {
 
 int main(int argc, char **argv) {
     if (argc < 2) {
-        printf("Bytefound v0.2 - 16-bit real mode C compiler\n");
+        printf("Byte-found v0.3 - 16-bit real mode C compiler\n");
         printf("Usage: bytefound file.c ...\n");
         printf("Or drop .c files onto the executable.\n\n");
         printf("Press Enter to exit...");

@@ -1,18 +1,20 @@
-/* Byte-found v0.3 test */
-int main() {
+/* Byte-found v0.4 test */
+
+int add(int a, int b) {
+    return a + b;
+}
+
+int sum_to(int n) {
     int i = 0;
-    int sum = 0;
-
-    while (i < 5) {
+    int total = 0;
+    while (i < n) {
         i = i + 1;
-        sum = sum + i;      // 1+2+3+4+5 = 15
+        total = total + i;
     }
+    return total;
+}
 
-    if (sum == 15) {
-        sum = sum - 4;
-    } else {
-        sum = 0;
-    }
-
-    return sum;             // expected result: 11
+int main() {
+    int x = sum_to(5);      // 1+2+3+4+5 = 15
+    return add(x, -4);      // expected result: 11
 }

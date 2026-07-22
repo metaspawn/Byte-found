@@ -1,7 +1,12 @@
-/* bytefound.c - Byte-found v0.3
+/* bytefound.c - Byte-found v0.4
    A C compiler written from scratch, targeting 16-bit x86 real mode.
-   Supports:  functions, return, local int variables, assignment,
-              integer arithmetic, comparisons, if/else and while.
+   Supports:  functions with parameters, function calls, return,
+              local int variables, assignment, integer arithmetic,
+              comparisons, if/else and while.
+
+   Calling convention: arguments are pushed left to right, the caller
+   cleans up the stack, and the result comes back in AX.
+
    Build:     gcc -std=c99 -Wall -Wextra -O2 src/bytefound.c -o bytefound.exe */
 
 #include <stdio.h>
@@ -170,6 +175,13 @@ static long expect_number(void) {
     return v;
 }
 
+/* Copy a token's text into a fixed buffer. */
+static void token_text(Token *t, char *buf, size_t size) {
+    size_t n = (size_t)t->len < size - 1 ? (size_t)t->len : size - 1;
+    memcpy(buf, t->loc, n);
+    buf[n] = '\0';
+}
+
 /* =============== labels ===============
    NASM scopes labels starting with '.' to the preceding global label,
    so per-function numbering never collides across functions. */
@@ -178,40 +190,49 @@ static int label_id;
 
 static int new_label(void) { return label_id++; }
 
-/* =============== local variables ===============
-   Every local int takes 2 bytes and lives at a negative offset
-   from BP:  first local at [bp-2], second at [bp-4], and so on. */
+/* =============== variables ===============
+   Parameters live above BP, locals below it. With arguments pushed
+   left to right, the frame of f(a, b, c) looks like:
 
-#define MAX_LOCALS 64
+       [bp+8]  a          <- pushed first
+       [bp+6]  b
+       [bp+4]  c          <- pushed last
+       [bp+2]  return address
+       [bp+0]  saved bp
+       [bp-2]  first local
+       [bp-4]  second local                                              */
+
+#define MAX_VARS   64
+#define MAX_PARAMS 16
 
 typedef struct {
     char name[64];
-    int  offset;      /* negative offset from BP */
-} Local;
+    int  offset;      /* signed offset from BP */
+} Var;
 
-static Local locals[MAX_LOCALS];
-static int   nlocals;
+static Var vars[MAX_VARS];
+static int nvars;         /* entries in the table, params included */
+static int nlocal_slots;  /* locals only, used to compute offsets   */
 
-static Local *find_local(Token *t) {
-    for (int i = 0; i < nlocals; i++)
-        if ((int)strlen(locals[i].name) == t->len &&
-            !strncmp(locals[i].name, t->loc, (size_t)t->len))
-            return &locals[i];
+static Var *find_var(Token *t) {
+    for (int i = 0; i < nvars; i++)
+        if ((int)strlen(vars[i].name) == t->len &&
+            !strncmp(vars[i].name, t->loc, (size_t)t->len))
+            return &vars[i];
     return NULL;
 }
 
-static Local *add_local(Token *t) {
-    if (find_local(t)) error_at(t->loc, "variable already declared");
-    if (nlocals >= MAX_LOCALS) error_at(t->loc, "too many local variables");
-    if (t->len >= (int)sizeof(locals[0].name))
-        error_at(t->loc, "variable name too long");
+static Var *add_var(Token *t, int offset) {
+    if (find_var(t)) error_at(t->loc, "name already declared");
+    if (nvars >= MAX_VARS) error_at(t->loc, "too many variables");
+    if (t->len >= (int)sizeof(vars[0].name))
+        error_at(t->loc, "name too long");
 
-    Local *lv = &locals[nlocals];
-    memcpy(lv->name, t->loc, (size_t)t->len);
-    lv->name[t->len] = '\0';
-    lv->offset = -2 * (nlocals + 1);
-    nlocals++;
-    return lv;
+    Var *v = &vars[nvars];
+    token_text(t, v->name, sizeof v->name);
+    v->offset = offset;
+    nvars++;
+    return v;
 }
 
 /* Count declarations ahead of time so the prologue knows how much
@@ -235,9 +256,29 @@ static int count_locals(Token *t) {
      add        := term  (('+' | '-') term)*
      term       := unary (('*' | '/') unary)*
      unary      := ('+' | '-')? primary
-     primary    := NUMBER | IDENT | '(' expr ')'                          */
+     primary    := NUMBER | IDENT | IDENT '(' args ')' | '(' expr ')'     */
 
 static void gen_expr(void);
+
+static void gen_funcall(void) {
+    char fname[256];
+    token_text(tk, fname, sizeof fname);
+    tk = tk->next->next;              /* skip the name and '(' */
+
+    int nargs = 0;
+    if (!equal(tk, ")")) {
+        for (;;) {
+            gen_expr();
+            fprintf(out, "    push ax\n");   /* left to right */
+            nargs++;
+            if (!consume(",")) break;
+        }
+    }
+    expect(")");
+
+    fprintf(out, "    call %s\n", fname);
+    if (nargs) fprintf(out, "    add sp, %d\n", nargs * 2);
+}
 
 static void gen_primary(void) {
     if (consume("(")) {
@@ -247,9 +288,11 @@ static void gen_primary(void) {
     }
 
     if (tk->kind == TK_IDENT) {
-        Local *lv = find_local(tk);
-        if (!lv) error_at(tk->loc, "undeclared variable");
-        fprintf(out, "    mov ax, [bp%+d]\n", lv->offset);
+        if (equal(tk->next, "(")) { gen_funcall(); return; }
+
+        Var *v = find_var(tk);
+        if (!v) error_at(tk->loc, "undeclared variable");
+        fprintf(out, "    mov ax, [bp%+d]\n", v->offset);
         tk = tk->next;
         return;
     }
@@ -344,11 +387,11 @@ static void gen_equality(void) {
 /* Assignment is right-associative, so a = b = 3 works. */
 static void gen_assign(void) {
     if (tk->kind == TK_IDENT && equal(tk->next, "=")) {
-        Local *lv = find_local(tk);
-        if (!lv) error_at(tk->loc, "undeclared variable");
+        Var *v = find_var(tk);
+        if (!v) error_at(tk->loc, "undeclared variable");
         tk = tk->next->next;              /* skip IDENT and '=' */
         gen_assign();
-        fprintf(out, "    mov [bp%+d], ax\n", lv->offset);
+        fprintf(out, "    mov [bp%+d], ax\n", v->offset);
         return;
     }
     gen_equality();
@@ -428,12 +471,13 @@ static void gen_stmt(void) {
     if (consume("int")) {
         if (tk->kind != TK_IDENT)
             error_at(tk->loc, "expected a variable name");
-        Local *lv = add_local(tk);
+        Var *v = add_var(tk, -2 * (nlocal_slots + 1));
+        nlocal_slots++;
         tk = tk->next;
 
         if (consume("=")) {
             gen_expr();
-            fprintf(out, "    mov [bp%+d], ax\n", lv->offset);
+            fprintf(out, "    mov [bp%+d], ax\n", v->offset);
         }
         expect(";");
         return;
@@ -443,7 +487,8 @@ static void gen_stmt(void) {
     expect(";");
 }
 
-/* function := 'int' IDENT '(' ')' '{' stmt* '}' */
+/* function := 'int' IDENT '(' params? ')' '{' stmt* '}'
+   params   := 'int' IDENT (',' 'int' IDENT)*                            */
 static void gen_function(void) {
     expect("int");
 
@@ -451,17 +496,37 @@ static void gen_function(void) {
         error_at(tk->loc, "expected a function name");
 
     char name[256];
-    int n = tk->len < 255 ? tk->len : 255;
-    memcpy(name, tk->loc, (size_t)n);
-    name[n] = '\0';
+    token_text(tk, name, sizeof name);
     tk = tk->next;
 
     expect("(");
+
+    Token *ptok[MAX_PARAMS];
+    int nparams = 0;
+
+    if (!equal(tk, ")")) {
+        for (;;) {
+            expect("int");
+            if (tk->kind != TK_IDENT)
+                error_at(tk->loc, "expected a parameter name");
+            if (nparams >= MAX_PARAMS)
+                error_at(tk->loc, "too many parameters");
+            ptok[nparams++] = tk;
+            tk = tk->next;
+            if (!consume(",")) break;
+        }
+    }
     expect(")");
 
-    /* Reset per-function state and measure the frame before emitting. */
-    nlocals  = 0;
-    label_id = 0;
+    /* Reset per-function state. */
+    nvars        = 0;
+    nlocal_slots = 0;
+    label_id     = 0;
+
+    /* Leftmost argument sits deepest, because args are pushed left to right. */
+    for (int i = 0; i < nparams; i++)
+        add_var(ptok[i], 4 + 2 * (nparams - 1 - i));
+
     int frame = count_locals(tk) * 2;
 
     expect("{");
@@ -525,7 +590,9 @@ static void compile_file(const char *path) {
 
     tk = tokenize(text);
 
-    fprintf(out, "; generated by Byte-found v0.3 - 16-bit real mode\n");
+    fprintf(out, "; generated by Byte-found v0.4 - 16-bit real mode\n");
+    fprintf(out, "; calling convention: args pushed left to right,\n");
+    fprintf(out, "; caller cleans the stack, result returned in AX\n");
     fprintf(out, "bits 16\n\n");
 
     while (tk->kind != TK_EOF)
@@ -535,13 +602,11 @@ static void compile_file(const char *path) {
     free(text);
 
     printf("[ok] %s -> %s\n", path, outpath);
-    printf("     assemble with: nasm -f bin %s -o output.bin\n", outpath);
-    printf("     or %%include it from your kernel source\n");
 }
 
 int main(int argc, char **argv) {
     if (argc < 2) {
-        printf("Byte-found v0.3 - 16-bit real mode C compiler\n");
+        printf("Byte-found v0.4 - 16-bit real mode C compiler\n");
         printf("Usage: bytefound file.c ...\n");
         printf("Or drop .c files onto the executable.\n\n");
         printf("Press Enter to exit...");
